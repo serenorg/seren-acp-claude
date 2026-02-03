@@ -215,13 +215,33 @@ impl ClaudeClient {
             })
         });
 
-        let options = ClaudeAgentOptions::builder()
-            .cwd(self.cwd.clone())
-            .permission_mode(PermissionMode::Default)
-            .can_use_tool(can_use_tool)
-            .include_partial_messages(true)
-            .max_thinking_tokens(31999)
-            .build();
+        // Use native binary if available (much faster than Node.js script)
+        let native_binary = std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_default()
+        ).join(".cursor/extensions/anthropic.claude-code-2.1.27-darwin-x64/resources/native-binary/claude");
+
+        let options = if native_binary.exists() {
+            info!("[ClaudeClient] Using native binary at: {:?}", native_binary);
+            ClaudeAgentOptions::builder()
+                .cwd(self.cwd.clone())
+                .permission_mode(PermissionMode::Default)
+                .can_use_tool(can_use_tool)
+                .include_partial_messages(true)
+                .max_thinking_tokens(31999)
+                .cli_path(native_binary)
+                .build()
+        } else {
+            ClaudeAgentOptions::builder()
+                .cwd(self.cwd.clone())
+                .permission_mode(PermissionMode::Default)
+                .can_use_tool(can_use_tool)
+                .include_partial_messages(true)
+                .max_thinking_tokens(31999)
+                .build()
+        };
+
+        info!("[ClaudeClient] Options: max_thinking_tokens={:?}, include_partial={:?}",
+              options.max_thinking_tokens, options.include_partial_messages);
 
         let mut sdk_client = claude_agent_sdk_rs::ClaudeClient::new(options);
         sdk_client.connect().await.map_err(Error::from)?;

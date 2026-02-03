@@ -5,7 +5,7 @@ use crate::acp::AcpOutbound;
 use crate::error::{Error, Result};
 use agent_client_protocol as acp;
 use claude_agent_sdk_rs::{
-    CanUseToolCallback, ClaudeAgentOptions, Message, PermissionMode, PermissionResult,
+    CanUseToolCallback, ClaudeAgentOptions, McpServers, Message, PermissionMode, PermissionResult,
     PermissionResultDeny,
 };
 use futures::StreamExt;
@@ -36,6 +36,8 @@ pub struct ClaudeClient {
     message_tx: broadcast::Sender<Message>,
     /// Cancel flag
     cancelled: Arc<Mutex<bool>>,
+    /// MCP servers configuration
+    mcp_servers: McpServers,
 }
 
 impl ClaudeClient {
@@ -44,6 +46,7 @@ impl ClaudeClient {
         cwd: PathBuf,
         session_id: acp::SessionId,
         acp_tx: mpsc::UnboundedSender<AcpOutbound>,
+        mcp_servers: McpServers,
     ) -> Self {
         let (message_tx, _) = broadcast::channel::<Message>(100);
         Self {
@@ -55,9 +58,9 @@ impl ClaudeClient {
             allowed_tools: Arc::new(RwLock::new(HashSet::new())),
             message_tx,
             cancelled: Arc::new(Mutex::new(false)),
+            mcp_servers,
         }
     }
-
     pub async fn set_session_mode(&self, mode_id: &str) -> Result<()> {
         let mode = match mode_id {
             "default" => PermissionMode::Default,
@@ -221,6 +224,7 @@ impl ClaudeClient {
             .can_use_tool(can_use_tool)
             .include_partial_messages(true)
             .max_thinking_tokens(31999)
+            .mcp_servers(self.mcp_servers.clone())
             .build();
 
         let mut sdk_client = claude_agent_sdk_rs::ClaudeClient::new(options);

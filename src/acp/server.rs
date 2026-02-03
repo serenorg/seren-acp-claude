@@ -4,12 +4,13 @@
 use super::AcpOutbound;
 use crate::claude::ClaudeClient;
 use agent_client_protocol::{self as acp, Client as _};
-use claude_agent_sdk_rs::{ContentBlock, Message, ToolResultContent};
+use claude_agent_sdk_rs::types::mcp::McpStdioServerConfig;
+use claude_agent_sdk_rs::{ContentBlock, McpServerConfig, McpServers, Message, ToolResultContent};
 
 use log::{debug, error, info};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc, RwLock};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Session data mapping ACP session to Claude client
@@ -78,6 +79,13 @@ impl acp::Agent for ClaudeAgent {
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         let cwd = request.cwd.to_string_lossy().to_string();
         info!("Received new session request for cwd: {}", cwd);
+        info!(
+            "MCP servers from client: {}",
+            request.mcp_servers.len()
+        );
+
+        // Convert ACP MCP servers to SDK format
+        let mcp_servers = convert_acp_mcp_to_sdk(&request.mcp_servers);
 
         // Generate session ID
         let session_id = {
@@ -92,6 +100,7 @@ impl acp::Agent for ClaudeAgent {
             request.cwd.clone(),
             acp::SessionId::new(session_id.clone()),
             self.acp_tx.clone(),
+            mcp_servers,
         ));
 
         // Connect to Claude CLI
@@ -373,6 +382,68 @@ fn tool_kind_for_claude_tool(tool_name: &str) -> acp::ToolKind {
         return acp::ToolKind::Fetch;
     }
     acp::ToolKind::Other
+}
+
+
+
+/// Convert ACP MCP server configurations to SDK format
+fn convert_acp_mcp_to_sdk(acp_servers: &[acp::McpServer]) -> McpServers {
+    if acp_servers.is_empty() {
+        return McpServers::Empty;
+    }
+
+    let mut servers = HashMap::new();
+
+    for server in acp_servers {
+        match server {
+            acp::McpServer::Stdio(stdio) => {
+                let name = stdio.name.clone();
+                let command = stdio.command.to_string_lossy().to_string();
+                let args = if stdio.args.is_empty() {
+                    None
+                } else {
+                    Some(stdio.args.clone())
+                };
+
+                // Convert env variables
+                let env = if stdio.env.is_empty() {
+                    None
+                } else {
+                    let env_map: HashMap<String, String> = stdio
+                        .env
+                        .iter()
+                        .map(|v| (v.name.clone(), v.value.clone()))
+                        .collect();
+                    Some(env_map)
+                };
+
+                info!(
+                    "Converting MCP server '{}': command={}, args={:?}",
+                    name, command, args
+                );
+
+                let config = McpServerConfig::Stdio(McpStdioServerConfig { command, args, env });
+                servers.insert(name, config);
+            }
+            // HTTP and SSE are not currently needed for seren-mcp stdio mode
+            acp::McpServer::Http(http) => {
+                info!("Skipping HTTP MCP server '{}' (not supported)", http.name);
+            }
+            acp::McpServer::Sse(sse) => {
+                info!("Skipping SSE MCP server '{}' (not supported)", sse.name);
+            }
+            // Handle any future server types
+            _ => {
+                info!("Skipping unknown MCP server type");
+            }
+        }
+    }
+
+    if servers.is_empty() {
+        McpServers::Empty
+    } else {
+        McpServers::Dict(servers)
+    }
 }
 
 /// Run the ACP server on stdio

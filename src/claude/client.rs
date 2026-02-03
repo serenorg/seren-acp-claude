@@ -220,6 +220,7 @@ impl ClaudeClient {
             .permission_mode(PermissionMode::Default)
             .can_use_tool(can_use_tool)
             .include_partial_messages(true)
+            .max_thinking_tokens(31999)
             .build();
 
         let mut sdk_client = claude_agent_sdk_rs::ClaudeClient::new(options);

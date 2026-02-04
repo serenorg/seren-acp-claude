@@ -105,8 +105,25 @@ impl acp::Agent for ClaudeAgent {
 
         // Connect to Claude CLI
         client.connect().await.map_err(|e| {
-            error!("Failed to connect to Claude CLI: {}", e);
-            acp::Error::new(-32603, format!("Failed to connect to Claude: {}", e))
+            let err_str = e.to_string();
+
+            // Extract clean error message for common cases
+            let clean_msg = if err_str.contains("below minimum required version") {
+                // Version mismatch - extract the actionable part
+                if let Some(start) = err_str.find("Claude Code CLI version") {
+                    err_str[start..].to_string()
+                } else {
+                    format!("Claude CLI version is outdated. Please update with: npm install -g @anthropic-ai/claude-code@latest")
+                }
+            } else if err_str.contains("not found") || err_str.contains("No such file") {
+                "Claude CLI not found. Please install with: npm install -g @anthropic-ai/claude-code".to_string()
+            } else {
+                // For other errors, include the full message
+                format!("Connection failed: {}", err_str)
+            };
+
+            error!("Failed to connect to Claude CLI: {}", clean_msg);
+            acp::Error::new(-32603, clean_msg)
         })?;
 
         info!("Created session {} for cwd {}", session_id, cwd);

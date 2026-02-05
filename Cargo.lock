@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "seren-acp-claude"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",

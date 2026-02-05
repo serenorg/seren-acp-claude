@@ -170,7 +170,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "claude-agent-sdk-rs"
 version = "0.6.4"
-source = "git+https://github.com/serenorg/claude-agent-sdk-rs?branch=fix%2Fcli-path-priority#81f3f9a7252c6c2d38c2746d23bf64791528a4f6"
+source = "git+https://github.com/serenorg/claude-agent-sdk-rs#16d826f079d14193680fc08847e42b4f0e5792da"
 dependencies = [
  "anyhow",
  "async-stream",

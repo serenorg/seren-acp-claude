@@ -24,7 +24,7 @@ path = "src/main.rs"
 agent-client-protocol = { version = "0.9", features = ["unstable"] }
 
 # Claude Agent SDK - spawns and communicates with Claude Code CLI
-claude-agent-sdk-rs = { git = "https://github.com/serenorg/claude-agent-sdk-rs", branch = "fix/cli-path-priority" }
+claude-agent-sdk-rs = { git = "https://github.com/serenorg/claude-agent-sdk-rs" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time", "process"] }

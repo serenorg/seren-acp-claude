@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use agent_client_protocol as acp;
 use claude_agent_sdk_rs::{
     CanUseToolCallback, ClaudeAgentOptions, McpServers, Message, PermissionMode, PermissionResult,
-    PermissionResultDeny,
+    PermissionResultAllow, PermissionResultDeny,
 };
 use futures::StreamExt;
 use log::{debug, info};
@@ -99,7 +99,7 @@ impl ClaudeClient {
                     *guard
                 };
                 if mode == PermissionMode::BypassPermissions {
-                    return PermissionResult::Allow(Default::default());
+                    return PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() });
                 }
 
                 // If the tool is already allowed for this session, allow without prompting.
@@ -108,7 +108,7 @@ impl ClaudeClient {
                     guard.contains(&tool_name)
                 };
                 if already_allowed {
-                    return PermissionResult::Allow(Default::default());
+                    return PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() });
                 }
 
                 // Prompt the ACP client for approval.
@@ -194,13 +194,13 @@ impl ClaudeClient {
                 ));
 
                 match decision {
-                    PermissionDecision::AllowOnce => PermissionResult::Allow(Default::default()),
+                    PermissionDecision::AllowOnce => PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() }),
                     PermissionDecision::AllowForSession => {
                         {
                             let mut guard = allowed_tools.write().await;
                             guard.insert(tool_name.clone());
                         }
-                        PermissionResult::Allow(Default::default())
+                        PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() })
                     }
                     PermissionDecision::RejectOnce => {
                         PermissionResult::Deny(PermissionResultDeny {

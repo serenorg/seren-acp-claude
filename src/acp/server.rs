@@ -326,15 +326,14 @@ fn convert_claude_message(message: &Message) -> Vec<acp::SessionUpdate> {
                         ))
                     }
                 }
-                ContentBlock::ToolUse(tool_use) => Some(acp::SessionUpdate::ToolCallUpdate(
-                    acp::ToolCallUpdate::new(
+                ContentBlock::ToolUse(tool_use) => Some(acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(
                         acp::ToolCallId::new(format!("claude-tool:{}", tool_use.id)),
-                        acp::ToolCallUpdateFields::new()
-                            .title(tool_use.name.clone())
-                            .kind(tool_kind_for_claude_tool(&tool_use.name))
-                            .status(acp::ToolCallStatus::InProgress)
-                            .raw_input(tool_use.input.clone()),
-                    ),
+                        tool_use.name.clone(),
+                    )
+                    .kind(tool_kind_for_claude_tool(&tool_use.name))
+                    .status(acp::ToolCallStatus::InProgress)
+                    .raw_input(tool_use.input.clone()),
                 )),
                 ContentBlock::ToolResult(tool_result) => {
                     let status = if tool_result.is_error.unwrap_or(false) {

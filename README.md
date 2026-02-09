@@ -9,6 +9,7 @@ ACP (Agent Client Protocol) for Claude Code.
 - Translates ACP prompt turns to Claude Code queries
 - Streams Claude output back to the client as ACP session updates
 - Bridges Claude tool approvals through ACP `session/request_permission`
+- Uses JSON-RPC 2.0 for the ACP transport (handled by `agent-client-protocol`)
 
 ## Architecture
 

@@ -24,6 +24,10 @@ pub struct ClaudeClient {
     client: Arc<Mutex<Option<claude_agent_sdk_rs::ClaudeClient>>>,
     /// Working directory
     cwd: PathBuf,
+    /// Claude Code session ID (persisted by the CLI on disk).
+    claude_session_id: String,
+    /// If set, connect() will resume this Claude Code session id (`claude --resume <id>`).
+    resume_session_id: Option<String>,
     /// ACP session ID for permission requests / notifications
     session_id: acp::SessionId,
     /// Channel to the ACP server for outbound messages (permission prompts, tool status updates)
@@ -44,6 +48,8 @@ impl ClaudeClient {
     /// Create a new Claude client for the given working directory
     pub(crate) fn new(
         cwd: PathBuf,
+        claude_session_id: String,
+        resume_session_id: Option<String>,
         session_id: acp::SessionId,
         acp_tx: mpsc::UnboundedSender<AcpOutbound>,
         mcp_servers: McpServers,
@@ -52,6 +58,8 @@ impl ClaudeClient {
         Self {
             client: Arc::new(Mutex::new(None)),
             cwd,
+            claude_session_id,
+            resume_session_id,
             session_id,
             acp_tx,
             permission_mode: Arc::new(RwLock::new(PermissionMode::Default)),
@@ -99,7 +107,10 @@ impl ClaudeClient {
                     *guard
                 };
                 if mode == PermissionMode::BypassPermissions {
-                    return PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() });
+                    return PermissionResult::Allow(PermissionResultAllow {
+                        updated_input: Some(input.clone()),
+                        ..Default::default()
+                    });
                 }
 
                 // If the tool is already allowed for this session, allow without prompting.
@@ -108,7 +119,10 @@ impl ClaudeClient {
                     guard.contains(&tool_name)
                 };
                 if already_allowed {
-                    return PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() });
+                    return PermissionResult::Allow(PermissionResultAllow {
+                        updated_input: Some(input.clone()),
+                        ..Default::default()
+                    });
                 }
 
                 // Prompt the ACP client for approval.
@@ -194,13 +208,21 @@ impl ClaudeClient {
                 ));
 
                 match decision {
-                    PermissionDecision::AllowOnce => PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() }),
+                    PermissionDecision::AllowOnce => {
+                        PermissionResult::Allow(PermissionResultAllow {
+                            updated_input: Some(input.clone()),
+                            ..Default::default()
+                        })
+                    }
                     PermissionDecision::AllowForSession => {
                         {
                             let mut guard = allowed_tools.write().await;
                             guard.insert(tool_name.clone());
                         }
-                        PermissionResult::Allow(PermissionResultAllow { updated_input: Some(input.clone()), ..Default::default() })
+                        PermissionResult::Allow(PermissionResultAllow {
+                            updated_input: Some(input.clone()),
+                            ..Default::default()
+                        })
                     }
                     PermissionDecision::RejectOnce => {
                         PermissionResult::Deny(PermissionResultDeny {
@@ -218,7 +240,7 @@ impl ClaudeClient {
             })
         });
 
-        let options = ClaudeAgentOptions::builder()
+        let mut options = ClaudeAgentOptions::builder()
             .cwd(self.cwd.clone())
             .permission_mode(PermissionMode::Default)
             .can_use_tool(can_use_tool)
@@ -226,6 +248,17 @@ impl ClaudeClient {
             .max_thinking_tokens(31999)
             .mcp_servers(self.mcp_servers.clone())
             .build();
+
+        // Ensure we can later `load_session` by using a stable, caller-defined session id.
+        // Claude Code persists sessions by id on disk (see `~/.claude/projects/...`).
+        options.extra_args.insert(
+            "session-id".to_string(),
+            Some(self.claude_session_id.clone()),
+        );
+
+        if let Some(ref resume_id) = self.resume_session_id {
+            options.resume = Some(resume_id.clone());
+        }
 
         let mut sdk_client = claude_agent_sdk_rs::ClaudeClient::new(options);
         sdk_client.connect().await.map_err(Error::from)?;

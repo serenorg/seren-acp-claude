@@ -7,10 +7,12 @@ use agent_client_protocol::{self as acp, Client as _};
 use claude_agent_sdk_rs::types::mcp::McpStdioServerConfig;
 use claude_agent_sdk_rs::{ContentBlock, McpServerConfig, McpServers, Message, ToolResultContent};
 
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Session data mapping ACP session to Claude client
@@ -27,8 +29,6 @@ pub struct ClaudeAgent {
     acp_tx: mpsc::UnboundedSender<AcpOutbound>,
     /// Session mappings: session_id -> SessionData
     sessions: RwLock<HashMap<String, SessionData>>,
-    /// Next session ID counter
-    next_session_id: RwLock<u64>,
 }
 
 impl ClaudeAgent {
@@ -37,9 +37,260 @@ impl ClaudeAgent {
         Self {
             acp_tx,
             sessions: RwLock::new(HashMap::new()),
-            next_session_id: RwLock::new(0),
         }
     }
+
+    fn emit_update(
+        &self,
+        session_id: &acp::SessionId,
+        update: acp::SessionUpdate,
+    ) -> Result<(), acp::Error> {
+        self.acp_tx
+            .send(AcpOutbound::SessionNotification(
+                acp::SessionNotification::new(session_id.clone(), update),
+            ))
+            .map_err(|_| acp::Error::new(-32603, "ACP outbound channel closed"))
+    }
+
+    fn claude_projects_root() -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home).join(".claude").join("projects"))
+    }
+
+    fn encode_project_dir_name(cwd: &Path) -> String {
+        // Claude Code stores per-project session indexes under:
+        //   ~/.claude/projects/<encoded-absolute-path>/
+        // where encoding is a simple path separator replacement (e.g. "/Users/a/b" -> "-Users-a-b").
+        let s = cwd.to_string_lossy();
+        format!("-{}", s.trim_start_matches('/').replace('/', "-"))
+    }
+
+    async fn find_sessions_index_path(cwd: &Path) -> Option<PathBuf> {
+        let root = Self::claude_projects_root()?;
+
+        // Fast-path: deterministic encoding.
+        let direct = root
+            .join(Self::encode_project_dir_name(cwd))
+            .join("sessions-index.json");
+        if tokio::fs::try_exists(&direct).await.unwrap_or(false) {
+            return Some(direct);
+        }
+
+        // Fallback: scan for a sessions-index.json whose originalPath matches the cwd.
+        let mut rd = tokio::fs::read_dir(root).await.ok()?;
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            let path = ent.path().join("sessions-index.json");
+            if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                continue;
+            }
+            let Ok(bytes) = tokio::fs::read(&path).await else {
+                continue;
+            };
+            let Ok(index) = serde_json::from_slice::<ClaudeSessionsIndex>(&bytes) else {
+                continue;
+            };
+            if index.original_path.as_deref() == Some(&cwd.to_string_lossy()) {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    async fn find_session_jsonl_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+        // Prefer the sessions-index fullPath if available.
+        if let Some(index_path) = Self::find_sessions_index_path(cwd).await {
+            if let Ok(bytes) = tokio::fs::read(&index_path).await {
+                if let Ok(index) = serde_json::from_slice::<ClaudeSessionsIndex>(&bytes) {
+                    if let Some(ent) = index.entries.iter().find(|e| e.session_id == session_id) {
+                        return Some(PathBuf::from(ent.full_path.clone()));
+                    }
+                }
+            }
+        }
+
+        // Best-effort fallback: infer the path.
+        let root = Self::claude_projects_root()?;
+        let dir = root.join(Self::encode_project_dir_name(cwd));
+        Some(dir.join(format!("{session_id}.jsonl")))
+    }
+
+    async fn replay_history_best_effort(
+        &self,
+        session_id: &acp::SessionId,
+        cwd: &Path,
+        claude_session_id: &str,
+    ) -> Result<(), acp::Error> {
+        let Some(path) = Self::find_session_jsonl_path(cwd, claude_session_id).await else {
+            return Ok(());
+        };
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(());
+        }
+
+        let file = tokio::fs::File::open(&path).await.map_err(|e| {
+            acp::Error::new(
+                -32603,
+                format!("Failed to read Claude session history: {e}"),
+            )
+        })?;
+        let mut lines = BufReader::new(file).lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(t) = v.get("type").and_then(|x| x.as_str()) else {
+                continue;
+            };
+
+            match t {
+                "user" => {
+                    let Some(content) = v
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                    else {
+                        continue;
+                    };
+                    for block in content {
+                        match block.get("type").and_then(|x| x.as_str()) {
+                            Some("text") => {
+                                let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                                if !text.is_empty() {
+                                    self.emit_update(
+                                        session_id,
+                                        acp::SessionUpdate::UserMessageChunk(
+                                            acp::ContentChunk::new(text.to_string().into()),
+                                        ),
+                                    )?;
+                                }
+                            }
+                            Some("tool_result") => {
+                                let tool_use_id = block
+                                    .get("tool_use_id")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("");
+                                if tool_use_id.is_empty() {
+                                    continue;
+                                }
+                                let is_error = block
+                                    .get("is_error")
+                                    .and_then(|x| x.as_bool())
+                                    .unwrap_or(false);
+                                let status = if is_error {
+                                    acp::ToolCallStatus::Failed
+                                } else {
+                                    acp::ToolCallStatus::Completed
+                                };
+                                let raw_output = block
+                                    .get("content")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                self.emit_update(
+                                    session_id,
+                                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                        acp::ToolCallId::new(format!("claude-tool:{tool_use_id}")),
+                                        acp::ToolCallUpdateFields::new()
+                                            .status(status)
+                                            .raw_output(raw_output),
+                                    )),
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "assistant" => {
+                    let Some(content) = v
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_array())
+                    else {
+                        continue;
+                    };
+                    for block in content {
+                        match block.get("type").and_then(|x| x.as_str()) {
+                            Some("text") => {
+                                let text = block.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                                if !text.is_empty() {
+                                    self.emit_update(
+                                        session_id,
+                                        acp::SessionUpdate::AgentMessageChunk(
+                                            acp::ContentChunk::new(text.to_string().into()),
+                                        ),
+                                    )?;
+                                }
+                            }
+                            Some("thinking") => {
+                                let text =
+                                    block.get("thinking").and_then(|x| x.as_str()).unwrap_or("");
+                                if !text.is_empty() {
+                                    self.emit_update(
+                                        session_id,
+                                        acp::SessionUpdate::AgentThoughtChunk(
+                                            acp::ContentChunk::new(text.to_string().into()),
+                                        ),
+                                    )?;
+                                }
+                            }
+                            Some("tool_use") => {
+                                let tool_use_id =
+                                    block.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                                let name =
+                                    block.get("name").and_then(|x| x.as_str()).unwrap_or("tool");
+                                if tool_use_id.is_empty() {
+                                    continue;
+                                }
+                                let input = block
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                self.emit_update(
+                                    session_id,
+                                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                                        acp::ToolCallId::new(format!("claude-tool:{tool_use_id}")),
+                                        acp::ToolCallUpdateFields::new()
+                                            .title(name.to_string())
+                                            .kind(tool_kind_for_claude_tool(name))
+                                            .status(acp::ToolCallStatus::InProgress)
+                                            .raw_input(input),
+                                    )),
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSessionsIndex {
+    #[serde(default)]
+    entries: Vec<ClaudeSessionsIndexEntry>,
+    #[serde(default, rename = "originalPath")]
+    original_path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeSessionsIndexEntry {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "fullPath")]
+    full_path: String,
+    #[serde(default, rename = "firstPrompt")]
+    first_prompt: Option<String>,
+    #[serde(default)]
+    modified: Option<String>,
+    #[serde(default, rename = "projectPath")]
+    project_path: Option<String>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -50,17 +301,28 @@ impl acp::Agent for ClaudeAgent {
     ) -> Result<acp::InitializeResponse, acp::Error> {
         info!("Received initialize request");
 
+        let protocol_version = if request.protocol_version < acp::ProtocolVersion::V1 {
+            acp::ProtocolVersion::V1
+        } else {
+            std::cmp::min(request.protocol_version, acp::ProtocolVersion::LATEST)
+        };
+
         // Build capabilities
         let prompt_caps = acp::PromptCapabilities::new()
             .embedded_context(true)
             .image(true);
-        let agent_caps = acp::AgentCapabilities::new().prompt_capabilities(prompt_caps);
+        let mut agent_caps = acp::AgentCapabilities::new()
+            .prompt_capabilities(prompt_caps)
+            .mcp_capabilities(acp::McpCapabilities::new())
+            .load_session(true);
+        agent_caps.session_capabilities =
+            acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new());
 
         // Build agent info
         let agent_info = acp::Implementation::new("seren-acp-claude", env!("CARGO_PKG_VERSION"))
             .title("Claude Code".to_string());
 
-        Ok(acp::InitializeResponse::new(request.protocol_version)
+        Ok(acp::InitializeResponse::new(protocol_version)
             .agent_capabilities(agent_caps)
             .agent_info(agent_info))
     }
@@ -79,25 +341,19 @@ impl acp::Agent for ClaudeAgent {
     ) -> Result<acp::NewSessionResponse, acp::Error> {
         let cwd = request.cwd.to_string_lossy().to_string();
         info!("Received new session request for cwd: {}", cwd);
-        info!(
-            "MCP servers from client: {}",
-            request.mcp_servers.len()
-        );
+        info!("MCP servers from client: {}", request.mcp_servers.len());
 
         // Convert ACP MCP servers to SDK format
         let mcp_servers = convert_acp_mcp_to_sdk(&request.mcp_servers);
 
         // Generate session ID
-        let session_id = {
-            let mut counter = self.next_session_id.write().await;
-            let id = *counter;
-            *counter += 1;
-            format!("session-{}", id)
-        };
+        let session_id = uuid::Uuid::new_v4().to_string();
 
         // Create Claude client for this session
         let client = Arc::new(ClaudeClient::new(
             request.cwd.clone(),
+            session_id.clone(),
+            None,
             acp::SessionId::new(session_id.clone()),
             self.acp_tx.clone(),
             mcp_servers,
@@ -154,11 +410,117 @@ impl acp::Agent for ClaudeAgent {
 
     async fn load_session(
         &self,
-        _request: acp::LoadSessionRequest,
+        request: acp::LoadSessionRequest,
     ) -> Result<acp::LoadSessionResponse, acp::Error> {
-        info!("Received load session request");
-        // Session loading not supported
-        Err(acp::Error::new(-32603, "Session loading not supported"))
+        let cwd = request.cwd.to_string_lossy().to_string();
+        let session_id = request.session_id.0.to_string();
+        info!(
+            "Received load session request: session={}, cwd={}",
+            session_id, cwd
+        );
+
+        // Best-effort: verify the session exists on disk before spawning a CLI.
+        let history_path = Self::find_session_jsonl_path(&request.cwd, &session_id).await;
+        let history_exists = match history_path.as_ref() {
+            Some(p) => tokio::fs::try_exists(p).await.unwrap_or(false),
+            None => false,
+        };
+        if !history_exists {
+            return Err(acp::Error::new(
+                -32603,
+                format!("Claude session not found: {session_id}"),
+            ));
+        }
+
+        // Convert ACP MCP servers to SDK format
+        let mcp_servers = convert_acp_mcp_to_sdk(&request.mcp_servers);
+
+        let client = Arc::new(ClaudeClient::new(
+            request.cwd.clone(),
+            session_id.clone(),
+            Some(session_id.clone()),
+            request.session_id.clone(),
+            self.acp_tx.clone(),
+            mcp_servers,
+        ));
+
+        client.connect().await.map_err(|e| {
+            let msg = format!("Failed to connect to Claude CLI for resume: {e}");
+            error!("{msg}");
+            acp::Error::new(-32603, msg)
+        })?;
+
+        // Store session mapping
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionData {
+                    client,
+                    cwd,
+                    mode_id: "default".to_string(),
+                },
+            );
+        }
+
+        // Replay transcript so clients without local persistence can reconstruct the conversation.
+        // seren-desktop suppresses these during resume when it already has local history.
+        if let Err(e) = self
+            .replay_history_best_effort(&request.session_id, &request.cwd, &session_id)
+            .await
+        {
+            warn!("Failed to replay Claude history (best-effort): {e}");
+        }
+
+        // Build session modes
+        let default_mode = acp::SessionMode::new("default", "Default")
+            .description("Standard behavior".to_string());
+        let bypass_mode = acp::SessionMode::new("bypassPermissions", "Bypass Permissions")
+            .description("Auto-approve all operations".to_string());
+
+        let mode_state = acp::SessionModeState::new("default", vec![default_mode, bypass_mode]);
+
+        Ok(acp::LoadSessionResponse::new().modes(mode_state))
+    }
+
+    async fn list_sessions(
+        &self,
+        request: acp::ListSessionsRequest,
+    ) -> Result<acp::ListSessionsResponse, acp::Error> {
+        info!("Received list sessions request");
+
+        let Some(cwd) = request.cwd.as_deref() else {
+            // Avoid scanning all projects by default (Claude stores thousands of per-project dirs).
+            return Ok(acp::ListSessionsResponse::new(Vec::new()));
+        };
+
+        let Some(index_path) = Self::find_sessions_index_path(cwd).await else {
+            return Ok(acp::ListSessionsResponse::new(Vec::new()));
+        };
+
+        let bytes = tokio::fs::read(&index_path)
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to read sessions index: {e}")))?;
+        let index: ClaudeSessionsIndex = serde_json::from_slice(&bytes)
+            .map_err(|e| acp::Error::new(-32603, format!("Invalid sessions index JSON: {e}")))?;
+
+        let mut out: Vec<acp::SessionInfo> = Vec::new();
+        for ent in index.entries {
+            let session_cwd = ent
+                .project_path
+                .clone()
+                .unwrap_or_else(|| cwd.to_string_lossy().to_string());
+            let mut info = acp::SessionInfo::new(ent.session_id, PathBuf::from(session_cwd));
+            if let Some(title) = ent.first_prompt {
+                info = info.title(title);
+            }
+            if let Some(updated_at) = ent.modified {
+                info = info.updated_at(updated_at);
+            }
+            out.push(info);
+        }
+
+        Ok(acp::ListSessionsResponse::new(out))
     }
 
     async fn prompt(&self, request: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {
@@ -400,8 +762,6 @@ fn tool_kind_for_claude_tool(tool_name: &str) -> acp::ToolKind {
     }
     acp::ToolKind::Other
 }
-
-
 
 /// Convert ACP MCP server configurations to SDK format
 fn convert_acp_mcp_to_sdk(acp_servers: &[acp::McpServer]) -> McpServers {

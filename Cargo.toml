@@ -27,7 +27,7 @@ agent-client-protocol = { version = "0.9", features = ["unstable"] }
 claude-agent-sdk-rs = { git = "https://github.com/serenorg/claude-agent-sdk-rs" }
 
 # Async runtime
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "time", "process", "fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 async-trait = "0.1"
 futures = "0.3"

@@ -28,6 +28,11 @@ pub struct ClaudeClient {
     claude_session_id: String,
     /// If set, connect() will resume this Claude Code session id (`claude --resume <id>`).
     resume_session_id: Option<String>,
+    /// If true, connect() will fork the resumed session (`claude --fork-session`).
+    ///
+    /// When used together with `resume_session_id`, we also force a new stable `--session-id`
+    /// so the fork persists as a separate session on disk.
+    fork_session: bool,
     /// ACP session ID for permission requests / notifications
     session_id: acp::SessionId,
     /// Channel to the ACP server for outbound messages (permission prompts, tool status updates)
@@ -50,6 +55,7 @@ impl ClaudeClient {
         cwd: PathBuf,
         claude_session_id: String,
         resume_session_id: Option<String>,
+        fork_session: bool,
         session_id: acp::SessionId,
         acp_tx: mpsc::UnboundedSender<AcpOutbound>,
         mcp_servers: McpServers,
@@ -60,6 +66,7 @@ impl ClaudeClient {
             cwd,
             claude_session_id,
             resume_session_id,
+            fork_session,
             session_id,
             acp_tx,
             permission_mode: Arc::new(RwLock::new(PermissionMode::Default)),
@@ -72,6 +79,8 @@ impl ClaudeClient {
     pub async fn set_session_mode(&self, mode_id: &str) -> Result<()> {
         let mode = match mode_id {
             "default" => PermissionMode::Default,
+            "acceptEdits" => PermissionMode::AcceptEdits,
+            "plan" => PermissionMode::Plan,
             "bypassPermissions" => PermissionMode::BypassPermissions,
             other => {
                 return Err(Error::ClaudeConnection(format!(
@@ -247,11 +256,14 @@ impl ClaudeClient {
             .include_partial_messages(true)
             .max_thinking_tokens(31999)
             .mcp_servers(self.mcp_servers.clone())
+            .fork_session(self.fork_session)
             .build();
 
         if let Some(ref resume_id) = self.resume_session_id {
             options.resume = Some(resume_id.clone());
-        } else {
+        }
+
+        if self.resume_session_id.is_none() || self.fork_session {
             // Ensure we can later `load_session` by using a stable, caller-defined session id.
             // Claude Code persists sessions by id on disk (see `~/.claude/projects/...`).
             options.extra_args.insert(
@@ -274,6 +286,20 @@ impl ClaudeClient {
     pub async fn is_connected(&self) -> bool {
         let guard = self.client.lock().await;
         guard.is_some()
+    }
+
+    pub async fn set_model(&self, model: Option<&str>) -> Result<()> {
+        let guard = self.client.lock().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| Error::ClaudeConnection("Not connected".to_string()))?;
+        client.set_model(model).await.map_err(Error::from)?;
+        Ok(())
+    }
+
+    pub async fn get_server_info(&self) -> Option<serde_json::Value> {
+        let guard = self.client.lock().await;
+        guard.as_ref().and_then(|c| c.get_server_info())
     }
 
     /// Send a query to Claude and stream responses

@@ -267,6 +267,46 @@ impl ClaudeAgent {
 
         Ok(())
     }
+
+    fn build_mode_state(current: &'static str) -> acp::SessionModeState {
+        // Claude Code supports these permission modes via its CLI (and the Rust SDK).
+        let default_mode = acp::SessionMode::new("default", "Default")
+            .description("Standard behavior".to_string());
+        let accept_edits_mode = acp::SessionMode::new("acceptEdits", "Accept Edits")
+            .description("Auto-accept file edit operations".to_string());
+        let plan_mode = acp::SessionMode::new("plan", "Plan Mode")
+            .description("Planning mode; no actual tool execution".to_string());
+        let bypass_mode = acp::SessionMode::new("bypassPermissions", "Bypass Permissions")
+            .description("Auto-approve all operations".to_string());
+
+        acp::SessionModeState::new(
+            current,
+            vec![default_mode, accept_edits_mode, plan_mode, bypass_mode],
+        )
+    }
+
+    async fn get_models_state_best_effort(client: &ClaudeClient) -> Option<acp::SessionModelState> {
+        let info = client.get_server_info().await?;
+        parse_models_from_server_info(&info)
+    }
+
+    async fn emit_available_commands_best_effort(
+        &self,
+        session_id: &acp::SessionId,
+        client: &ClaudeClient,
+    ) {
+        let Some(info) = client.get_server_info().await else {
+            return;
+        };
+        let cmds = parse_commands_from_server_info(&info);
+        if cmds.is_empty() {
+            return;
+        }
+        let _ = self.emit_update(
+            session_id,
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(cmds)),
+        );
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -315,8 +355,10 @@ impl acp::Agent for ClaudeAgent {
             .prompt_capabilities(prompt_caps)
             .mcp_capabilities(acp::McpCapabilities::new())
             .load_session(true);
-        agent_caps.session_capabilities =
-            acp::SessionCapabilities::new().list(acp::SessionListCapabilities::new());
+        agent_caps.session_capabilities = acp::SessionCapabilities::new()
+            .list(acp::SessionListCapabilities::new())
+            .fork(acp::SessionForkCapabilities::new())
+            .resume(acp::SessionResumeCapabilities::new());
 
         // Build agent info
         let agent_info = acp::Implementation::new("seren-acp-claude", env!("CARGO_PKG_VERSION"))
@@ -354,6 +396,7 @@ impl acp::Agent for ClaudeAgent {
             request.cwd.clone(),
             session_id.clone(),
             None,
+            false,
             acp::SessionId::new(session_id.clone()),
             self.acp_tx.clone(),
             mcp_servers,
@@ -384,6 +427,13 @@ impl acp::Agent for ClaudeAgent {
 
         info!("Created session {} for cwd {}", session_id, cwd);
 
+        let acp_session_id = acp::SessionId::new(session_id.clone());
+        self.emit_available_commands_best_effort(&acp_session_id, client.as_ref())
+            .await;
+
+        let mode_state = Self::build_mode_state("default");
+        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+
         // Store session mapping
         {
             let mut sessions = self.sessions.write().await;
@@ -397,15 +447,9 @@ impl acp::Agent for ClaudeAgent {
             );
         }
 
-        // Build session modes
-        let default_mode = acp::SessionMode::new("default", "Default")
-            .description("Standard behavior".to_string());
-        let bypass_mode = acp::SessionMode::new("bypassPermissions", "Bypass Permissions")
-            .description("Auto-approve all operations".to_string());
-
-        let mode_state = acp::SessionModeState::new("default", vec![default_mode, bypass_mode]);
-
-        Ok(acp::NewSessionResponse::new(session_id).modes(mode_state))
+        Ok(acp::NewSessionResponse::new(session_id)
+            .modes(mode_state)
+            .models(models))
     }
 
     async fn load_session(
@@ -439,6 +483,7 @@ impl acp::Agent for ClaudeAgent {
             request.cwd.clone(),
             session_id.clone(),
             Some(session_id.clone()),
+            false,
             request.session_id.clone(),
             self.acp_tx.clone(),
             mcp_servers,
@@ -449,6 +494,21 @@ impl acp::Agent for ClaudeAgent {
             error!("{msg}");
             acp::Error::new(-32603, msg)
         })?;
+
+        // Replay transcript so clients without local persistence can reconstruct the conversation.
+        // seren-desktop suppresses these during resume when it already has local history.
+        if let Err(e) = self
+            .replay_history_best_effort(&request.session_id, &request.cwd, &session_id)
+            .await
+        {
+            warn!("Failed to replay Claude history (best-effort): {e}");
+        }
+
+        self.emit_available_commands_best_effort(&request.session_id, client.as_ref())
+            .await;
+
+        let mode_state = Self::build_mode_state("default");
+        let models = Self::get_models_state_best_effort(client.as_ref()).await;
 
         // Store session mapping
         {
@@ -463,24 +523,9 @@ impl acp::Agent for ClaudeAgent {
             );
         }
 
-        // Replay transcript so clients without local persistence can reconstruct the conversation.
-        // seren-desktop suppresses these during resume when it already has local history.
-        if let Err(e) = self
-            .replay_history_best_effort(&request.session_id, &request.cwd, &session_id)
-            .await
-        {
-            warn!("Failed to replay Claude history (best-effort): {e}");
-        }
-
-        // Build session modes
-        let default_mode = acp::SessionMode::new("default", "Default")
-            .description("Standard behavior".to_string());
-        let bypass_mode = acp::SessionMode::new("bypassPermissions", "Bypass Permissions")
-            .description("Auto-approve all operations".to_string());
-
-        let mode_state = acp::SessionModeState::new("default", vec![default_mode, bypass_mode]);
-
-        Ok(acp::LoadSessionResponse::new().modes(mode_state))
+        Ok(acp::LoadSessionResponse::new()
+            .modes(mode_state)
+            .models(models))
     }
 
     async fn list_sessions(
@@ -521,6 +566,140 @@ impl acp::Agent for ClaudeAgent {
         }
 
         Ok(acp::ListSessionsResponse::new(out))
+    }
+
+    async fn resume_session(
+        &self,
+        request: acp::ResumeSessionRequest,
+    ) -> Result<acp::ResumeSessionResponse, acp::Error> {
+        let cwd = request.cwd.to_string_lossy().to_string();
+        let session_id = request.session_id.0.to_string();
+        info!(
+            "Received resume session request: session={}, cwd={}",
+            session_id, cwd
+        );
+
+        // Best-effort: verify the session exists on disk before spawning a CLI.
+        let history_path = Self::find_session_jsonl_path(&request.cwd, &session_id).await;
+        let history_exists = match history_path.as_ref() {
+            Some(p) => tokio::fs::try_exists(p).await.unwrap_or(false),
+            None => false,
+        };
+        if !history_exists {
+            return Err(acp::Error::new(
+                -32603,
+                format!("Claude session not found: {session_id}"),
+            ));
+        }
+
+        let mcp_servers = convert_acp_mcp_to_sdk(&request.mcp_servers);
+
+        let client = Arc::new(ClaudeClient::new(
+            request.cwd.clone(),
+            session_id.clone(),
+            Some(session_id.clone()),
+            false,
+            request.session_id.clone(),
+            self.acp_tx.clone(),
+            mcp_servers,
+        ));
+
+        client.connect().await.map_err(|e| {
+            let msg = format!("Failed to connect to Claude CLI for resume: {e}");
+            error!("{msg}");
+            acp::Error::new(-32603, msg)
+        })?;
+
+        self.emit_available_commands_best_effort(&request.session_id, client.as_ref())
+            .await;
+
+        // No transcript replay for resume_session.
+        let mode_state = Self::build_mode_state("default");
+        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(
+                session_id.clone(),
+                SessionData {
+                    client,
+                    cwd,
+                    mode_id: "default".to_string(),
+                },
+            );
+        }
+
+        Ok(acp::ResumeSessionResponse::new()
+            .modes(mode_state)
+            .models(models))
+    }
+
+    async fn fork_session(
+        &self,
+        request: acp::ForkSessionRequest,
+    ) -> Result<acp::ForkSessionResponse, acp::Error> {
+        let cwd = request.cwd.to_string_lossy().to_string();
+        let from_session_id = request.session_id.0.to_string();
+        info!(
+            "Received fork session request: from_session={}, cwd={}",
+            from_session_id, cwd
+        );
+
+        // Verify the source session exists before forking.
+        let history_path = Self::find_session_jsonl_path(&request.cwd, &from_session_id).await;
+        let history_exists = match history_path.as_ref() {
+            Some(p) => tokio::fs::try_exists(p).await.unwrap_or(false),
+            None => false,
+        };
+        if !history_exists {
+            return Err(acp::Error::new(
+                -32603,
+                format!("Claude session not found: {from_session_id}"),
+            ));
+        }
+
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+
+        let mcp_servers = convert_acp_mcp_to_sdk(&request.mcp_servers);
+
+        let client = Arc::new(ClaudeClient::new(
+            request.cwd.clone(),
+            new_session_id.clone(),
+            Some(from_session_id.clone()),
+            true,
+            acp::SessionId::new(new_session_id.clone()),
+            self.acp_tx.clone(),
+            mcp_servers,
+        ));
+
+        client.connect().await.map_err(|e| {
+            let msg = format!("Failed to connect to Claude CLI for fork: {e}");
+            error!("{msg}");
+            acp::Error::new(-32603, msg)
+        })?;
+
+        let acp_session_id = acp::SessionId::new(new_session_id.clone());
+        self.emit_available_commands_best_effort(&acp_session_id, client.as_ref())
+            .await;
+
+        let mode_state = Self::build_mode_state("default");
+        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(
+                new_session_id.clone(),
+                SessionData {
+                    client,
+                    cwd,
+                    mode_id: "default".to_string(),
+                },
+            );
+        }
+
+        Ok(acp::ForkSessionResponse::new(new_session_id)
+            .modes(mode_state)
+            .models(models))
     }
 
     async fn prompt(&self, request: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {
@@ -630,7 +809,11 @@ impl acp::Agent for ClaudeAgent {
         let session_id_str: &str = &request.session_id.0;
         let mode_id: &str = request.mode_id.0.as_ref();
 
-        if mode_id != "default" && mode_id != "bypassPermissions" {
+        if mode_id != "default"
+            && mode_id != "acceptEdits"
+            && mode_id != "plan"
+            && mode_id != "bypassPermissions"
+        {
             return Err(acp::Error::new(
                 -32602,
                 format!("Unsupported mode id: {mode_id}"),
@@ -651,6 +834,35 @@ impl acp::Agent for ClaudeAgent {
         }
 
         Ok(acp::SetSessionModeResponse::default())
+    }
+
+    async fn set_session_model(
+        &self,
+        request: acp::SetSessionModelRequest,
+    ) -> Result<acp::SetSessionModelResponse, acp::Error> {
+        let session_id_str: &str = &request.session_id.0;
+        let model_id: &str = request.model_id.0.as_ref();
+        info!(
+            "Received set session model request: session={}, model={}",
+            session_id_str, model_id
+        );
+
+        let client = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(session_id_str)
+                .map(|s| Arc::clone(&s.client))
+                .ok_or_else(|| {
+                    acp::Error::new(-32603, format!("Session not found: {session_id_str}"))
+                })?
+        };
+
+        client
+            .set_model(Some(model_id))
+            .await
+            .map_err(|e| acp::Error::new(-32603, format!("Failed to set session model: {e}")))?;
+
+        Ok(acp::SetSessionModelResponse::new())
     }
 
     async fn ext_method(&self, _request: acp::ExtRequest) -> Result<acp::ExtResponse, acp::Error> {
@@ -761,6 +973,80 @@ fn tool_kind_for_claude_tool(tool_name: &str) -> acp::ToolKind {
         return acp::ToolKind::Fetch;
     }
     acp::ToolKind::Other
+}
+
+fn parse_models_from_server_info(info: &serde_json::Value) -> Option<acp::SessionModelState> {
+    let models = info.get("models")?.as_array()?;
+
+    let mut available: Vec<acp::ModelInfo> = Vec::new();
+    for model in models {
+        let id = model
+            .get("value")
+            .and_then(|v| v.as_str())
+            .or_else(|| model.get("modelId").and_then(|v| v.as_str()))
+            .or_else(|| model.get("model_id").and_then(|v| v.as_str()))
+            .or_else(|| model.get("id").and_then(|v| v.as_str()))
+            .or_else(|| model.get("name").and_then(|v| v.as_str()));
+        let Some(id) = id.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+
+        let name = model
+            .get("displayName")
+            .and_then(|v| v.as_str())
+            .or_else(|| model.get("display_name").and_then(|v| v.as_str()))
+            .or_else(|| model.get("name").and_then(|v| v.as_str()))
+            .unwrap_or(id);
+
+        let description = model.get("description").and_then(|v| v.as_str());
+
+        let mut info = acp::ModelInfo::new(id.to_string(), name.to_string());
+        if let Some(desc) = description {
+            info = info.description(desc.to_string());
+        }
+        available.push(info);
+    }
+
+    let current = available.first()?.model_id.clone();
+    Some(acp::SessionModelState::new(current, available))
+}
+
+fn parse_commands_from_server_info(info: &serde_json::Value) -> Vec<acp::AvailableCommand> {
+    let Some(cmds) = info.get("commands").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<acp::AvailableCommand> = Vec::new();
+    for c in cmds {
+        let Some(name) = c.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let description = c
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut cmd = acp::AvailableCommand::new(name.to_string(), description);
+
+        let hint = match c.get("argumentHint").or_else(|| c.get("argument_hint")) {
+            Some(v) if v.is_string() => v.as_str().map(|s| s.to_string()),
+            Some(v) if v.is_array() => v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+            _ => None,
+        };
+        if let Some(hint) = hint.filter(|s| !s.is_empty()) {
+            cmd = cmd.input(acp::AvailableCommandInput::Unstructured(
+                acp::UnstructuredCommandInput::new(hint),
+            ));
+        }
+
+        out.push(cmd);
+    }
+    out
 }
 
 /// Convert ACP MCP server configurations to SDK format

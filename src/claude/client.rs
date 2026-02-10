@@ -249,15 +249,15 @@ impl ClaudeClient {
             .mcp_servers(self.mcp_servers.clone())
             .build();
 
-        // Ensure we can later `load_session` by using a stable, caller-defined session id.
-        // Claude Code persists sessions by id on disk (see `~/.claude/projects/...`).
-        options.extra_args.insert(
-            "session-id".to_string(),
-            Some(self.claude_session_id.clone()),
-        );
-
         if let Some(ref resume_id) = self.resume_session_id {
             options.resume = Some(resume_id.clone());
+        } else {
+            // Ensure we can later `load_session` by using a stable, caller-defined session id.
+            // Claude Code persists sessions by id on disk (see `~/.claude/projects/...`).
+            options.extra_args.insert(
+                "session-id".to_string(),
+                Some(self.claude_session_id.clone()),
+            );
         }
 
         let mut sdk_client = claude_agent_sdk_rs::ClaudeClient::new(options);

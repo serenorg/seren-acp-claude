@@ -115,6 +115,24 @@ impl ClaudeAgent {
         Some(dir.join(format!("{session_id}.jsonl")))
     }
 
+    fn replay_chunk_meta(v: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("replay".to_string(), serde_json::Value::Bool(true));
+
+        if let Some(message_id) = v.get("uuid").and_then(|x| x.as_str()) {
+            meta.insert(
+                "messageId".to_string(),
+                serde_json::Value::String(message_id.to_string()),
+            );
+        }
+
+        if let Some(timestamp) = v.get("timestamp").cloned() {
+            meta.insert("timestamp".to_string(), timestamp);
+        }
+
+        meta
+    }
+
     async fn replay_history_best_effort(
         &self,
         session_id: &acp::SessionId,
@@ -144,6 +162,8 @@ impl ClaudeAgent {
                 continue;
             };
 
+            let replay_meta = Self::replay_chunk_meta(&v);
+
             match t {
                 "user" => {
                     let Some(content) = v
@@ -161,7 +181,8 @@ impl ClaudeAgent {
                                     self.emit_update(
                                         session_id,
                                         acp::SessionUpdate::UserMessageChunk(
-                                            acp::ContentChunk::new(text.to_string().into()),
+                                            acp::ContentChunk::new(text.to_string().into())
+                                                .meta(replay_meta.clone()),
                                         ),
                                     )?;
                                 }
@@ -217,7 +238,8 @@ impl ClaudeAgent {
                                     self.emit_update(
                                         session_id,
                                         acp::SessionUpdate::AgentMessageChunk(
-                                            acp::ContentChunk::new(text.to_string().into()),
+                                            acp::ContentChunk::new(text.to_string().into())
+                                                .meta(replay_meta.clone()),
                                         ),
                                     )?;
                                 }
@@ -229,7 +251,8 @@ impl ClaudeAgent {
                                     self.emit_update(
                                         session_id,
                                         acp::SessionUpdate::AgentThoughtChunk(
-                                            acp::ContentChunk::new(text.to_string().into()),
+                                            acp::ContentChunk::new(text.to_string().into())
+                                                .meta(replay_meta.clone()),
                                         ),
                                     )?;
                                 }

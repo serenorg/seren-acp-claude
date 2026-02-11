@@ -8,7 +8,7 @@ use claude_agent_sdk_rs::types::mcp::McpStdioServerConfig;
 use claude_agent_sdk_rs::{ContentBlock, McpServerConfig, McpServers, Message, ToolResultContent};
 
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -21,6 +21,7 @@ struct SessionData {
     #[allow(dead_code)]
     cwd: String,
     mode_id: String,
+    current_model_id: Option<String>,
 }
 
 /// Claude ACP Agent - bridges ACP protocol to Claude Code CLI
@@ -285,9 +286,12 @@ impl ClaudeAgent {
         )
     }
 
-    async fn get_models_state_best_effort(client: &ClaudeClient) -> Option<acp::SessionModelState> {
+    async fn get_models_state_best_effort(
+        client: &ClaudeClient,
+        preferred_model: Option<&str>,
+    ) -> Option<acp::SessionModelState> {
         let info = client.get_server_info().await?;
-        parse_models_from_server_info(&info)
+        parse_models_from_server_info(&info, preferred_model)
     }
 
     async fn emit_available_commands_best_effort(
@@ -432,7 +436,10 @@ impl acp::Agent for ClaudeAgent {
             .await;
 
         let mode_state = Self::build_mode_state("default");
-        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+        let models = Self::get_models_state_best_effort(client.as_ref(), None).await;
+        let current_model_id = models
+            .as_ref()
+            .map(|m| m.current_model_id.0.as_ref().to_string());
 
         // Store session mapping
         {
@@ -443,6 +450,7 @@ impl acp::Agent for ClaudeAgent {
                     client,
                     cwd,
                     mode_id: "default".to_string(),
+                    current_model_id,
                 },
             );
         }
@@ -508,7 +516,10 @@ impl acp::Agent for ClaudeAgent {
             .await;
 
         let mode_state = Self::build_mode_state("default");
-        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+        let models = Self::get_models_state_best_effort(client.as_ref(), None).await;
+        let current_model_id = models
+            .as_ref()
+            .map(|m| m.current_model_id.0.as_ref().to_string());
 
         // Store session mapping
         {
@@ -519,6 +530,7 @@ impl acp::Agent for ClaudeAgent {
                     client,
                     cwd,
                     mode_id: "default".to_string(),
+                    current_model_id,
                 },
             );
         }
@@ -615,7 +627,10 @@ impl acp::Agent for ClaudeAgent {
 
         // No transcript replay for resume_session.
         let mode_state = Self::build_mode_state("default");
-        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+        let models = Self::get_models_state_best_effort(client.as_ref(), None).await;
+        let current_model_id = models
+            .as_ref()
+            .map(|m| m.current_model_id.0.as_ref().to_string());
 
         {
             let mut sessions = self.sessions.write().await;
@@ -625,6 +640,7 @@ impl acp::Agent for ClaudeAgent {
                     client,
                     cwd,
                     mode_id: "default".to_string(),
+                    current_model_id,
                 },
             );
         }
@@ -683,7 +699,10 @@ impl acp::Agent for ClaudeAgent {
             .await;
 
         let mode_state = Self::build_mode_state("default");
-        let models = Self::get_models_state_best_effort(client.as_ref()).await;
+        let models = Self::get_models_state_best_effort(client.as_ref(), None).await;
+        let current_model_id = models
+            .as_ref()
+            .map(|m| m.current_model_id.0.as_ref().to_string());
 
         {
             let mut sessions = self.sessions.write().await;
@@ -693,6 +712,7 @@ impl acp::Agent for ClaudeAgent {
                     client,
                     cwd,
                     mode_id: "default".to_string(),
+                    current_model_id,
                 },
             );
         }
@@ -862,6 +882,13 @@ impl acp::Agent for ClaudeAgent {
             .await
             .map_err(|e| acp::Error::new(-32603, format!("Failed to set session model: {e}")))?;
 
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(session_id_str) {
+                session.current_model_id = Some(model_id.to_string());
+            }
+        }
+
         Ok(acp::SetSessionModelResponse::new())
     }
 
@@ -975,30 +1002,96 @@ fn tool_kind_for_claude_tool(tool_name: &str) -> acp::ToolKind {
     acp::ToolKind::Other
 }
 
-fn parse_models_from_server_info(info: &serde_json::Value) -> Option<acp::SessionModelState> {
-    let models = info.get("models")?.as_array()?;
+fn parse_models_from_server_info(
+    info: &serde_json::Value,
+    preferred_model: Option<&str>,
+) -> Option<acp::SessionModelState> {
+    let mut model_entries: Vec<serde_json::Value> = Vec::new();
+    if let Some(models) = info.get("models") {
+        append_model_entries(models, &mut model_entries);
+    }
+    for key in [
+        "availableModels",
+        "available_models",
+        "modelOptions",
+        "model_options",
+    ] {
+        if let Some(v) = info.get(key) {
+            append_model_entries(v, &mut model_entries);
+        }
+    }
+
+    if model_entries.is_empty() {
+        return None;
+    }
 
     let mut available: Vec<acp::ModelInfo> = Vec::new();
-    for model in models {
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut current_from_flags: Option<String> = None;
+    let mut default_from_flags: Option<String> = None;
+
+    for model in &model_entries {
         let id = model
             .get("value")
             .and_then(|v| v.as_str())
             .or_else(|| model.get("modelId").and_then(|v| v.as_str()))
             .or_else(|| model.get("model_id").and_then(|v| v.as_str()))
             .or_else(|| model.get("id").and_then(|v| v.as_str()))
-            .or_else(|| model.get("name").and_then(|v| v.as_str()));
+            .or_else(|| model.get("name").and_then(|v| v.as_str()))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
         let Some(id) = id.filter(|s| !s.is_empty()) else {
             continue;
         };
+
+        if !seen_ids.insert(id.to_string()) {
+            continue;
+        }
 
         let name = model
             .get("displayName")
             .and_then(|v| v.as_str())
             .or_else(|| model.get("display_name").and_then(|v| v.as_str()))
             .or_else(|| model.get("name").and_then(|v| v.as_str()))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
             .unwrap_or(id);
 
         let description = model.get("description").and_then(|v| v.as_str());
+
+        if current_from_flags.is_none()
+            && (model
+                .get("isCurrent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || model
+                    .get("current")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                || model
+                    .get("isSelected")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                || model
+                    .get("selected")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false))
+        {
+            current_from_flags = Some(id.to_string());
+        }
+
+        if default_from_flags.is_none()
+            && (model
+                .get("isDefault")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || model
+                    .get("default")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false))
+        {
+            default_from_flags = Some(id.to_string());
+        }
 
         let mut info = acp::ModelInfo::new(id.to_string(), name.to_string());
         if let Some(desc) = description {
@@ -1007,8 +1100,177 @@ fn parse_models_from_server_info(info: &serde_json::Value) -> Option<acp::Sessio
         available.push(info);
     }
 
-    let current = available.first()?.model_id.clone();
+    if available.is_empty() {
+        return None;
+    }
+
+    let current = preferred_model
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .filter(|id| seen_ids.contains(*id))
+        .map(|s| s.to_string())
+        .or_else(|| {
+            extract_current_model_id_from_info(info).filter(|id| seen_ids.contains(id.as_str()))
+        })
+        .or(current_from_flags)
+        .or(default_from_flags)
+        .or_else(|| available.first().map(|m| m.model_id.0.as_ref().to_string()))?;
+
     Some(acp::SessionModelState::new(current, available))
+}
+
+fn append_model_entries(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    match value {
+        serde_json::Value::Array(arr) => {
+            out.extend(arr.iter().cloned());
+        }
+        serde_json::Value::Object(obj) => {
+            let mut found_nested = false;
+            for key in [
+                "available",
+                "availableModels",
+                "available_models",
+                "models",
+                "items",
+                "options",
+            ] {
+                if let Some(v) = obj.get(key) {
+                    found_nested = true;
+                    append_model_entries(v, out);
+                }
+            }
+
+            if !found_nested {
+                for (id, entry) in obj {
+                    match entry {
+                        serde_json::Value::Object(model_obj) => {
+                            let mut with_id = model_obj.clone();
+                            if !(with_id.contains_key("id")
+                                || with_id.contains_key("modelId")
+                                || with_id.contains_key("model_id")
+                                || with_id.contains_key("value")
+                                || with_id.contains_key("name"))
+                            {
+                                with_id.insert(
+                                    "id".to_string(),
+                                    serde_json::Value::String(id.to_string()),
+                                );
+                            }
+                            out.push(serde_json::Value::Object(with_id));
+                        }
+                        serde_json::Value::String(name) => {
+                            out.push(serde_json::json!({ "id": id, "name": name }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_current_model_id_from_info(info: &serde_json::Value) -> Option<String> {
+    for key in [
+        "currentModelId",
+        "current_model_id",
+        "modelId",
+        "model_id",
+        "model",
+    ] {
+        if let Some(raw) = info.get(key)
+            && let Some(id) = extract_model_id(raw)
+        {
+            return Some(id);
+        }
+    }
+
+    if let Some(models_obj) = info.get("models").and_then(|v| v.as_object()) {
+        for key in [
+            "currentModelId",
+            "current_model_id",
+            "modelId",
+            "model_id",
+            "model",
+        ] {
+            if let Some(raw) = models_obj.get(key)
+                && let Some(id) = extract_model_id(raw)
+            {
+                return Some(id);
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_model_id(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+
+    let obj = value.as_object()?;
+    for key in ["value", "modelId", "model_id", "id", "name"] {
+        if let Some(s) = obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_models_uses_explicit_current_model_id() {
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-opus-4-1", "displayName": "Opus 4.1" },
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
+            ],
+            "currentModelId": "claude-sonnet-4-5"
+        });
+
+        let state = parse_models_from_server_info(&info, None).expect("models parsed");
+        assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
+        assert_eq!(state.available_models.len(), 2);
+    }
+
+    #[test]
+    fn parse_models_supports_map_style_payload() {
+        let info = serde_json::json!({
+            "models": {
+                "claude-opus-4-1": { "displayName": "Opus 4.1", "isDefault": true },
+                "claude-sonnet-4-5": { "displayName": "Sonnet 4.5" }
+            }
+        });
+
+        let state = parse_models_from_server_info(&info, None).expect("models parsed");
+        assert_eq!(state.current_model_id.0.as_ref(), "claude-opus-4-1");
+        assert_eq!(state.available_models.len(), 2);
+    }
+
+    #[test]
+    fn parse_models_prefers_session_selected_model() {
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-opus-4-1", "displayName": "Opus 4.1" },
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
+            ],
+            "currentModelId": "claude-opus-4-1"
+        });
+
+        let state =
+            parse_models_from_server_info(&info, Some("claude-sonnet-4-5")).expect("models parsed");
+        assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
+    }
 }
 
 fn parse_commands_from_server_info(info: &serde_json::Value) -> Vec<acp::AvailableCommand> {

@@ -5,7 +5,9 @@ use super::AcpOutbound;
 use crate::claude::ClaudeClient;
 use agent_client_protocol::{self as acp, Client as _};
 use claude_agent_sdk_rs::types::mcp::McpStdioServerConfig;
-use claude_agent_sdk_rs::{ContentBlock, McpServerConfig, McpServers, Message, ToolResultContent};
+use claude_agent_sdk_rs::{
+    ContentBlock, McpServerConfig, McpServers, Message, ToolResultContent, UserContentBlock,
+};
 
 use log::{debug, error, info, warn};
 use std::collections::{HashMap, HashSet};
@@ -760,27 +762,48 @@ impl acp::Agent for ClaudeAgent {
                 })?
         };
 
-        // Extract prompt text from content blocks
-        let prompt_text: String = request
-            .prompt
-            .iter()
-            .filter_map(|block| {
-                if let acp::ContentBlock::Text(text) = block {
-                    Some(text.text.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Convert ACP content blocks to SDK UserContentBlocks
+        let mut content_blocks: Vec<UserContentBlock> = Vec::new();
+        let mut has_text = false;
 
-        if prompt_text.is_empty() {
+        for block in &request.prompt {
+            match block {
+                acp::ContentBlock::Text(text) => {
+                    if !text.text.is_empty() {
+                        content_blocks.push(UserContentBlock::text(text.text.clone()));
+                        has_text = true;
+                    }
+                }
+                acp::ContentBlock::Image(image) => {
+                    // Convert ACP ImageContent to SDK UserContentBlock::Image
+                    match UserContentBlock::image_from_base64(
+                        &image.mime_type,
+                        &image.data,
+                    ) {
+                        Ok(image_block) => {
+                            info!("Added image block: type={}", image.mime_type);
+                            content_blocks.push(image_block);
+                        }
+                        Err(e) => {
+                            error!("Failed to create image block: {}", e);
+                            return Err(acp::Error::new(
+                                -32602,
+                                format!("Invalid image data: {}", e),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !has_text {
             return Err(acp::Error::new(-32602, "No text content in prompt"));
         }
 
         debug!(
-            "Sending prompt to Claude: {}",
-            prompt_text.chars().take(100).collect::<String>()
+            "Sending {} content blocks to Claude ({} images)",
+            content_blocks.len(),
+            content_blocks.len() - content_blocks.iter().filter(|b| matches!(b, UserContentBlock::Text { .. })).count()
         );
 
         // Subscribe to message stream before sending query
@@ -816,11 +839,14 @@ impl acp::Agent for ClaudeAgent {
             }
         });
 
-        // Send query to Claude
-        client.query(&prompt_text).await.map_err(|e| {
-            error!("Claude query failed: {}", e);
-            acp::Error::new(-32603, format!("Query failed: {}", e))
-        })?;
+        // Send query with content blocks (supports text + images)
+        client
+            .query_with_content(content_blocks)
+            .await
+            .map_err(|e| {
+                error!("Claude query failed: {}", e);
+                acp::Error::new(-32603, format!("Query failed: {}", e))
+            })?;
 
         Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
     }

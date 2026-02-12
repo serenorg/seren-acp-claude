@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use agent_client_protocol as acp;
 use claude_agent_sdk_rs::{
     CanUseToolCallback, ClaudeAgentOptions, McpServers, Message, PermissionMode, PermissionResult,
-    PermissionResultAllow, PermissionResultDeny,
+    PermissionResultAllow, PermissionResultDeny, UserContentBlock,
 };
 use futures::StreamExt;
 use log::{debug, info};
@@ -329,6 +329,70 @@ impl ClaudeClient {
         client.query(text).await.map_err(Error::from)?;
 
         // Apply the current session permission mode to this query (if the client supports it).
+        let mode = {
+            let guard = self.permission_mode.read().await;
+            *guard
+        };
+        if let Err(e) = client.set_permission_mode(mode).await {
+            log::warn!("Failed to set Claude permission mode: {}", e);
+        }
+
+        // Get response stream and process
+        let message_tx = self.message_tx.clone();
+        let cancelled = self.cancelled.clone();
+        let mut stream = client.receive_response();
+
+        while let Some(result) = stream.next().await {
+            // Check for cancellation
+            {
+                let is_cancelled = *cancelled.lock().await;
+                if is_cancelled {
+                    info!("Query cancelled");
+                    break;
+                }
+            }
+
+            match result {
+                Ok(message) => {
+                    debug!(
+                        "Received message from Claude: {:?}",
+                        std::mem::discriminant(&message)
+                    );
+                    let is_result = matches!(message, Message::Result(_));
+                    let _ = message_tx.send(message);
+                    if is_result {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    return Err(Error::from(e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send a query with structured content blocks (supports text + images)
+    pub async fn query_with_content(&self, content: Vec<UserContentBlock>) -> Result<()> {
+        debug!("Sending query with {} content blocks to Claude", content.len());
+
+        // Reset cancelled flag
+        {
+            let mut cancelled = self.cancelled.lock().await;
+            *cancelled = false;
+        }
+
+        // Acquire lock for the entire query + streaming operation
+        let mut guard = self.client.lock().await;
+        let client = guard
+            .as_mut()
+            .ok_or_else(|| Error::ClaudeConnection("Not connected".to_string()))?;
+
+        // Send the query with content blocks
+        client.query_with_content(content).await.map_err(Error::from)?;
+
+        // Apply the current session permission mode
         let mode = {
             let guard = self.permission_mode.read().await;
             *guard

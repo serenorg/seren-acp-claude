@@ -51,9 +51,10 @@ impl acp::Agent for ClaudeAgent {
         info!("Received initialize request");
 
         // Build capabilities
+        // Note: Image support is not yet implemented (see issue #7)
+        // Image blocks are currently ignored in the prompt() handler
         let prompt_caps = acp::PromptCapabilities::new()
-            .embedded_context(true)
-            .image(true);
+            .embedded_context(true);
         let agent_caps = acp::AgentCapabilities::new().prompt_capabilities(prompt_caps);
 
         // Build agent info

@@ -776,7 +776,7 @@ impl acp::Agent for ClaudeAgent {
                 }
                 acp::ContentBlock::Image(image) => {
                     // Convert ACP ImageContent to SDK UserContentBlock::Image
-                    match UserContentBlock::image_from_base64(
+                    match UserContentBlock::image_base64(
                         &image.mime_type,
                         &image.data,
                     ) {
@@ -792,6 +792,10 @@ impl acp::Agent for ClaudeAgent {
                             ));
                         }
                     }
+                }
+                _ => {
+                    // Ignore unsupported content block types
+                    warn!("Unsupported content block type, skipping");
                 }
             }
         }

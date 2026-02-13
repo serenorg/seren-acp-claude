@@ -315,8 +315,20 @@ impl ClaudeAgent {
         client: &ClaudeClient,
         preferred_model: Option<&str>,
     ) -> Option<acp::SessionModelState> {
-        let info = client.get_server_info().await?;
-        parse_models_from_server_info(&info, preferred_model)
+        debug!("[ACP MODELS] Attempting to get server info for models...");
+        let info = match client.get_server_info().await {
+            Some(i) => {
+                debug!("[ACP MODELS] Server info available: {:?}", i);
+                i
+            }
+            None => {
+                warn!("[ACP MODELS] Server info not available yet - models will be None");
+                return None;
+            }
+        };
+        let models = parse_models_from_server_info(&info, preferred_model);
+        debug!("[ACP MODELS] Parsed models: {:?}", models.as_ref().map(|m| &m.available_models.len()));
+        models
     }
 
     async fn emit_available_commands_best_effort(

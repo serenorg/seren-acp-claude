@@ -327,7 +327,7 @@ impl ClaudeAgent {
             }
         };
         let models = parse_models_from_server_info(&info, preferred_model);
-        debug!("[ACP MODELS] Parsed models: {:?}", models.as_ref().map(|m| &m.available_models.len()));
+        debug!("[ACP MODELS] Parsed models: {:?}", models.as_ref().map(|m| m.available_models.len()));
         models
     }
 

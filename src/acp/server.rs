@@ -1072,9 +1072,19 @@ fn parse_models_from_server_info(
     preferred_model: Option<&str>,
 ) -> Option<acp::SessionModelState> {
     let mut model_entries: Vec<serde_json::Value> = Vec::new();
+
+    // Check top-level models
     if let Some(models) = info.get("models") {
         append_model_entries(models, &mut model_entries);
     }
+
+    // Check response.models (Claude CLI server info structure)
+    if let Some(response) = info.get("response") {
+        if let Some(models) = response.get("models") {
+            append_model_entries(models, &mut model_entries);
+        }
+    }
+
     for key in [
         "availableModels",
         "available_models",
@@ -1262,6 +1272,39 @@ fn extract_current_model_id_from_info(info: &serde_json::Value) -> Option<String
                 && let Some(id) = extract_model_id(raw)
             {
                 return Some(id);
+            }
+        }
+    }
+
+    // Check response.models (Claude CLI server info structure)
+    if let Some(response) = info.get("response") {
+        for key in [
+            "currentModelId",
+            "current_model_id",
+            "modelId",
+            "model_id",
+            "model",
+        ] {
+            if let Some(raw) = response.get(key)
+                && let Some(id) = extract_model_id(raw)
+            {
+                return Some(id);
+            }
+        }
+
+        if let Some(models_obj) = response.get("models").and_then(|v| v.as_object()) {
+            for key in [
+                "currentModelId",
+                "current_model_id",
+                "modelId",
+                "model_id",
+                "model",
+            ] {
+                if let Some(raw) = models_obj.get(key)
+                    && let Some(id) = extract_model_id(raw)
+                {
+                    return Some(id);
+                }
             }
         }
     }

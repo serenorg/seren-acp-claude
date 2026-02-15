@@ -170,7 +170,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "claude-agent-sdk-rs"
 version = "0.6.5"
-source = "git+https://github.com/serenorg/claude-agent-sdk-rs#60d1f6edb332c5d17875105e966cc43d1511579e"
+source = "git+https://github.com/serenorg/claude-agent-sdk-rs#afed32eeacd8562f3d5024eb671130d2b677f6de"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "seren-acp-claude"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agent-client-protocol",
  "async-trait",

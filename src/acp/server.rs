@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Session data mapping ACP session to Claude client
@@ -827,6 +827,12 @@ impl acp::Agent for ClaudeAgent {
         let session_id = request.session_id.clone();
         let acp_tx = self.acp_tx.clone();
 
+        // Shared slot for the forwarding task to deposit ResultMessage data
+        let result_usage: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let result_num_turns: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let result_usage_clone = Arc::clone(&result_usage);
+        let result_num_turns_clone = Arc::clone(&result_num_turns);
+
         // Spawn task to forward Claude messages to ACP notifications
         tokio::task::spawn_local(async move {
             loop {
@@ -844,8 +850,12 @@ impl acp::Agent for ClaudeAgent {
                             }
                         }
 
-                        // Check for result message
-                        if matches!(message, Message::Result(_)) {
+                        // Extract usage data from Result message before breaking
+                        if let Message::Result(ref result) = message {
+                            if let Some(ref usage) = result.usage {
+                                *result_usage_clone.lock().await = Some(usage.clone());
+                            }
+                            *result_num_turns_clone.lock().await = Some(result.num_turns);
                             break;
                         }
                     }
@@ -864,7 +874,21 @@ impl acp::Agent for ClaudeAgent {
                 acp::Error::new(-32603, format!("Query failed: {}", e))
             })?;
 
-        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+        // Build response with usage metadata if available
+        let mut response = acp::PromptResponse::new(acp::StopReason::EndTurn);
+        let usage = result_usage.lock().await.take();
+        let num_turns = result_num_turns.lock().await.take();
+        if usage.is_some() || num_turns.is_some() {
+            let mut meta = serde_json::Map::new();
+            if let Some(u) = usage {
+                meta.insert("usage".into(), u);
+            }
+            if let Some(n) = num_turns {
+                meta.insert("numTurns".into(), serde_json::json!(n));
+            }
+            response = response.meta(meta);
+        }
+        Ok(response)
     }
 
     async fn cancel(&self, request: acp::CancelNotification) -> Result<(), acp::Error> {

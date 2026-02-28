@@ -327,6 +327,7 @@ impl ClaudeAgent {
             }
         };
         let models = parse_models_from_server_info(&info, preferred_model);
+        let models = supplement_known_models(models);
         debug!("[ACP MODELS] Parsed models: {:?}", models.as_ref().map(|m| m.available_models.len()));
         models
     }
@@ -1217,6 +1218,45 @@ fn parse_models_from_server_info(
     Some(acp::SessionModelState::new(current, available))
 }
 
+/// Known Claude models that should always be available in the selector.
+/// The CLI may only advertise a subset; we supplement with the full list
+/// so users can select Opus and other models.
+const KNOWN_CLAUDE_MODELS: &[(&str, &str)] = &[
+    ("claude-opus-4-6", "Opus 4.6"),
+    ("claude-opus-4-1", "Opus 4.1"),
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-sonnet-4-5", "Sonnet 4.5"),
+    ("claude-sonnet-4-0", "Sonnet 4"),
+    ("claude-haiku-3-5", "Haiku 3.5"),
+];
+
+/// Ensure known Claude models are present in the model list. If the CLI
+/// only reports a subset (e.g., "Default", "Sonnet", "Haiku"), this adds
+/// the missing ones so users can select Opus, etc.
+fn supplement_known_models(
+    state: Option<acp::SessionModelState>,
+) -> Option<acp::SessionModelState> {
+    let Some(mut state) = state else {
+        return None;
+    };
+
+    let existing_ids: HashSet<String> = state
+        .available_models
+        .iter()
+        .map(|m| m.model_id.0.as_ref().to_string())
+        .collect();
+
+    for &(id, name) in KNOWN_CLAUDE_MODELS {
+        if !existing_ids.contains(id) {
+            state
+                .available_models
+                .push(acp::ModelInfo::new(id.to_string(), name.to_string()));
+        }
+    }
+
+    Some(state)
+}
+
 fn append_model_entries(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
     match value {
         serde_json::Value::Array(arr) => {
@@ -1401,6 +1441,54 @@ mod tests {
         let state =
             parse_models_from_server_info(&info, Some("claude-sonnet-4-5")).expect("models parsed");
         assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn supplement_adds_missing_known_models() {
+        // Simulate CLI only reporting Sonnet and Haiku (no Opus)
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5", "isCurrent": true },
+                { "value": "claude-haiku-3-5", "displayName": "Haiku 3.5" }
+            ]
+        });
+
+        let parsed = parse_models_from_server_info(&info, None);
+        let state = supplement_known_models(parsed).expect("models present");
+
+        // Should have the original 2 + missing known models
+        let ids: Vec<&str> = state
+            .available_models
+            .iter()
+            .map(|m| m.model_id.0.as_ref())
+            .collect();
+        assert!(ids.contains(&"claude-opus-4-6"), "Opus 4.6 should be added");
+        assert!(ids.contains(&"claude-opus-4-1"), "Opus 4.1 should be added");
+        assert!(ids.contains(&"claude-sonnet-4-5"), "Sonnet 4.5 should remain");
+        assert!(ids.contains(&"claude-haiku-3-5"), "Haiku 3.5 should remain");
+        // Haiku 3.5 should not be duplicated
+        assert_eq!(ids.iter().filter(|&&id| id == "claude-haiku-3-5").count(), 1);
+    }
+
+    #[test]
+    fn supplement_does_not_duplicate_existing_models() {
+        // CLI already reports Opus — supplement should not add it again
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-opus-4-6", "displayName": "Opus 4.6", "isCurrent": true },
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
+            ]
+        });
+
+        let parsed = parse_models_from_server_info(&info, None);
+        let state = supplement_known_models(parsed).expect("models present");
+
+        let opus_count = state
+            .available_models
+            .iter()
+            .filter(|m| m.model_id.0.as_ref() == "claude-opus-4-6")
+            .count();
+        assert_eq!(opus_count, 1, "Opus 4.6 should not be duplicated");
     }
 }
 

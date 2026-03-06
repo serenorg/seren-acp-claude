@@ -170,7 +170,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "claude-agent-sdk-rs"
 version = "0.6.5"
-source = "git+https://github.com/serenorg/claude-agent-sdk-rs#5b920400f499f9f45119e2e02cdc6ccaef869963"
+source = "git+https://github.com/serenorg/claude-agent-sdk-rs#8909b526fc01fed6dc136c09b7de6853e7d7c470"
 dependencies = [
  "anyhow",
  "async-stream",

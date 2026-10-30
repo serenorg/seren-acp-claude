@@ -328,7 +328,10 @@ impl ClaudeAgent {
         };
         let models = parse_models_from_server_info(&info, preferred_model);
         let models = supplement_known_models(models);
-        debug!("[ACP MODELS] Parsed models: {:?}", models.as_ref().map(|m| m.available_models.len()));
+        debug!(
+            "[ACP MODELS] Parsed models: {:?}",
+            models.as_ref().map(|m| m.available_models.len())
+        );
         models
     }
 
@@ -789,10 +792,7 @@ impl acp::Agent for ClaudeAgent {
                 }
                 acp::ContentBlock::Image(image) => {
                     // Convert ACP ImageContent to SDK UserContentBlock::Image
-                    match UserContentBlock::image_base64(
-                        &image.mime_type,
-                        &image.data,
-                    ) {
+                    match UserContentBlock::image_base64(&image.mime_type, &image.data) {
                         Ok(image_block) => {
                             info!("Added image block: type={}", image.mime_type);
                             content_blocks.push(image_block);
@@ -820,7 +820,11 @@ impl acp::Agent for ClaudeAgent {
         debug!(
             "Sending {} content blocks to Claude ({} images)",
             content_blocks.len(),
-            content_blocks.len() - content_blocks.iter().filter(|b| matches!(b, UserContentBlock::Text { .. })).count()
+            content_blocks.len()
+                - content_blocks
+                    .iter()
+                    .filter(|b| matches!(b, UserContentBlock::Text { .. }))
+                    .count()
         );
 
         // Subscribe to message stream before sending query
@@ -1462,9 +1466,15 @@ mod tests {
             .collect();
         assert!(ids.contains(&"claude-opus-4-6"), "Opus 4.6 should be added");
         assert!(ids.contains(&"claude-opus-4-1"), "Opus 4.1 should be added");
-        assert!(ids.contains(&"claude-sonnet-4-5"), "Sonnet 4.5 should remain");
+        assert!(
+            ids.contains(&"claude-sonnet-4-5"),
+            "Sonnet 4.5 should remain"
+        );
         assert!(ids.contains(&"claude-haiku-3-5"), "Haiku 3.5 should remain");
-        assert_eq!(ids.iter().filter(|&&id| id == "claude-haiku-3-5").count(), 1);
+        assert_eq!(
+            ids.iter().filter(|&&id| id == "claude-haiku-3-5").count(),
+            1
+        );
     }
 
     #[test]

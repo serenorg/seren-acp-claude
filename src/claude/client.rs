@@ -375,7 +375,10 @@ impl ClaudeClient {
 
     /// Send a query with structured content blocks (supports text + images)
     pub async fn query_with_content(&self, content: Vec<UserContentBlock>) -> Result<()> {
-        debug!("Sending query with {} content blocks to Claude", content.len());
+        debug!(
+            "Sending query with {} content blocks to Claude",
+            content.len()
+        );
 
         // Reset cancelled flag
         {
@@ -390,7 +393,10 @@ impl ClaudeClient {
             .ok_or_else(|| Error::ClaudeConnection("Not connected".to_string()))?;
 
         // Send the query with content blocks
-        client.query_with_content(content).await.map_err(Error::from)?;
+        client
+            .query_with_content(content)
+            .await
+            .map_err(Error::from)?;
 
         // Apply the current session permission mode
         let mode = {

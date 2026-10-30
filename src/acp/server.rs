@@ -101,14 +101,12 @@ impl ClaudeAgent {
 
     async fn find_session_jsonl_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
         // Prefer the sessions-index fullPath if available.
-        if let Some(index_path) = Self::find_sessions_index_path(cwd).await {
-            if let Ok(bytes) = tokio::fs::read(&index_path).await {
-                if let Ok(index) = serde_json::from_slice::<ClaudeSessionsIndex>(&bytes) {
-                    if let Some(ent) = index.entries.iter().find(|e| e.session_id == session_id) {
-                        return Some(PathBuf::from(ent.full_path.clone()));
-                    }
-                }
-            }
+        if let Some(index_path) = Self::find_sessions_index_path(cwd).await
+            && let Ok(bytes) = tokio::fs::read(&index_path).await
+            && let Ok(index) = serde_json::from_slice::<ClaudeSessionsIndex>(&bytes)
+            && let Some(ent) = index.entries.iter().find(|e| e.session_id == session_id)
+        {
+            return Some(PathBuf::from(ent.full_path.clone()));
         }
 
         // Best-effort fallback: infer the path.
@@ -457,7 +455,7 @@ impl acp::Agent for ClaudeAgent {
                 if let Some(start) = err_str.find("Claude Code CLI version") {
                     err_str[start..].to_string()
                 } else {
-                    format!("Claude CLI version is outdated. Please update with: npm install -g @anthropic-ai/claude-code@latest")
+                    "Claude CLI version is outdated. Please update with: npm install -g @anthropic-ai/claude-code@latest".to_string()
                 }
             } else if err_str.contains("not found") || err_str.contains("No such file") {
                 "Claude CLI not found. Please install with: npm install -g @anthropic-ai/claude-code".to_string()
@@ -1107,10 +1105,10 @@ fn parse_models_from_server_info(
     }
 
     // Check response.models (Claude CLI server info structure)
-    if let Some(response) = info.get("response") {
-        if let Some(models) = response.get("models") {
-            append_model_entries(models, &mut model_entries);
-        }
+    if let Some(response) = info.get("response")
+        && let Some(models) = response.get("models")
+    {
+        append_model_entries(models, &mut model_entries);
     }
 
     for key in [
@@ -1240,9 +1238,7 @@ const KNOWN_CLAUDE_MODELS: &[(&str, &str)] = &[
 fn supplement_known_models(
     state: Option<acp::SessionModelState>,
 ) -> Option<acp::SessionModelState> {
-    let Some(mut state) = state else {
-        return None;
-    };
+    let mut state = state?;
 
     let existing_ids: HashSet<String> = state
         .available_models
@@ -1399,105 +1395,6 @@ fn extract_model_id(value: &serde_json::Value) -> Option<String> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_models_uses_explicit_current_model_id() {
-        let info = serde_json::json!({
-            "models": [
-                { "value": "claude-opus-4-1", "displayName": "Opus 4.1" },
-                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
-            ],
-            "currentModelId": "claude-sonnet-4-5"
-        });
-
-        let state = parse_models_from_server_info(&info, None).expect("models parsed");
-        assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
-        assert_eq!(state.available_models.len(), 2);
-    }
-
-    #[test]
-    fn parse_models_supports_map_style_payload() {
-        let info = serde_json::json!({
-            "models": {
-                "claude-opus-4-1": { "displayName": "Opus 4.1", "isDefault": true },
-                "claude-sonnet-4-5": { "displayName": "Sonnet 4.5" }
-            }
-        });
-
-        let state = parse_models_from_server_info(&info, None).expect("models parsed");
-        assert_eq!(state.current_model_id.0.as_ref(), "claude-opus-4-1");
-        assert_eq!(state.available_models.len(), 2);
-    }
-
-    #[test]
-    fn parse_models_prefers_session_selected_model() {
-        let info = serde_json::json!({
-            "models": [
-                { "value": "claude-opus-4-1", "displayName": "Opus 4.1" },
-                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
-            ],
-            "currentModelId": "claude-opus-4-1"
-        });
-
-        let state =
-            parse_models_from_server_info(&info, Some("claude-sonnet-4-5")).expect("models parsed");
-        assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
-    }
-
-    #[test]
-    fn supplement_adds_missing_known_models() {
-        let info = serde_json::json!({
-            "models": [
-                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5", "isCurrent": true },
-                { "value": "claude-haiku-3-5", "displayName": "Haiku 3.5" }
-            ]
-        });
-
-        let parsed = parse_models_from_server_info(&info, None);
-        let state = supplement_known_models(parsed).expect("models present");
-
-        let ids: Vec<&str> = state
-            .available_models
-            .iter()
-            .map(|m| m.model_id.0.as_ref())
-            .collect();
-        assert!(ids.contains(&"claude-opus-4-6"), "Opus 4.6 should be added");
-        assert!(ids.contains(&"claude-opus-4-1"), "Opus 4.1 should be added");
-        assert!(
-            ids.contains(&"claude-sonnet-4-5"),
-            "Sonnet 4.5 should remain"
-        );
-        assert!(ids.contains(&"claude-haiku-3-5"), "Haiku 3.5 should remain");
-        assert_eq!(
-            ids.iter().filter(|&&id| id == "claude-haiku-3-5").count(),
-            1
-        );
-    }
-
-    #[test]
-    fn supplement_does_not_duplicate_existing_models() {
-        let info = serde_json::json!({
-            "models": [
-                { "value": "claude-opus-4-6", "displayName": "Opus 4.6", "isCurrent": true },
-                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
-            ]
-        });
-
-        let parsed = parse_models_from_server_info(&info, None);
-        let state = supplement_known_models(parsed).expect("models present");
-
-        let opus_count = state
-            .available_models
-            .iter()
-            .filter(|m| m.model_id.0.as_ref() == "claude-opus-4-6")
-            .count();
-        assert_eq!(opus_count, 1, "Opus 4.6 should not be duplicated");
-    }
-}
-
 fn parse_commands_from_server_info(info: &serde_json::Value) -> Vec<acp::AvailableCommand> {
     let Some(cmds) = info.get("commands").and_then(|v| v.as_array()) else {
         return Vec::new();
@@ -1640,4 +1537,103 @@ pub async fn run_acp_server() -> Result<(), acp::Error> {
             handle_io.await
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_models_uses_explicit_current_model_id() {
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-opus-4-1", "displayName": "Opus 4.1" },
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
+            ],
+            "currentModelId": "claude-sonnet-4-5"
+        });
+
+        let state = parse_models_from_server_info(&info, None).expect("models parsed");
+        assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
+        assert_eq!(state.available_models.len(), 2);
+    }
+
+    #[test]
+    fn parse_models_supports_map_style_payload() {
+        let info = serde_json::json!({
+            "models": {
+                "claude-opus-4-1": { "displayName": "Opus 4.1", "isDefault": true },
+                "claude-sonnet-4-5": { "displayName": "Sonnet 4.5" }
+            }
+        });
+
+        let state = parse_models_from_server_info(&info, None).expect("models parsed");
+        assert_eq!(state.current_model_id.0.as_ref(), "claude-opus-4-1");
+        assert_eq!(state.available_models.len(), 2);
+    }
+
+    #[test]
+    fn parse_models_prefers_session_selected_model() {
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-opus-4-1", "displayName": "Opus 4.1" },
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
+            ],
+            "currentModelId": "claude-opus-4-1"
+        });
+
+        let state =
+            parse_models_from_server_info(&info, Some("claude-sonnet-4-5")).expect("models parsed");
+        assert_eq!(state.current_model_id.0.as_ref(), "claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn supplement_adds_missing_known_models() {
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5", "isCurrent": true },
+                { "value": "claude-haiku-3-5", "displayName": "Haiku 3.5" }
+            ]
+        });
+
+        let parsed = parse_models_from_server_info(&info, None);
+        let state = supplement_known_models(parsed).expect("models present");
+
+        let ids: Vec<&str> = state
+            .available_models
+            .iter()
+            .map(|m| m.model_id.0.as_ref())
+            .collect();
+        assert!(ids.contains(&"claude-opus-4-6"), "Opus 4.6 should be added");
+        assert!(ids.contains(&"claude-opus-4-1"), "Opus 4.1 should be added");
+        assert!(
+            ids.contains(&"claude-sonnet-4-5"),
+            "Sonnet 4.5 should remain"
+        );
+        assert!(ids.contains(&"claude-haiku-3-5"), "Haiku 3.5 should remain");
+        assert_eq!(
+            ids.iter().filter(|&&id| id == "claude-haiku-3-5").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn supplement_does_not_duplicate_existing_models() {
+        let info = serde_json::json!({
+            "models": [
+                { "value": "claude-opus-4-6", "displayName": "Opus 4.6", "isCurrent": true },
+                { "value": "claude-sonnet-4-5", "displayName": "Sonnet 4.5" }
+            ]
+        });
+
+        let parsed = parse_models_from_server_info(&info, None);
+        let state = supplement_known_models(parsed).expect("models present");
+
+        let opus_count = state
+            .available_models
+            .iter()
+            .filter(|m| m.model_id.0.as_ref() == "claude-opus-4-6")
+            .count();
+        assert_eq!(opus_count, 1, "Opus 4.6 should not be duplicated");
+    }
 }

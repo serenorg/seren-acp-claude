@@ -454,10 +454,10 @@ impl ClaudeClient {
         *cancelled = true;
 
         // Try to interrupt the SDK client
-        if let Some(ref client) = *self.client.lock().await {
-            if let Err(e) = client.interrupt().await {
-                log::warn!("Failed to interrupt Claude CLI: {}", e);
-            }
+        if let Some(ref client) = *self.client.lock().await
+            && let Err(e) = client.interrupt().await
+        {
+            log::warn!("Failed to interrupt Claude CLI: {}", e);
         }
     }
 }
